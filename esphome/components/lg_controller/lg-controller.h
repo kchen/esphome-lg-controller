@@ -182,6 +182,12 @@ class LgController final : public climate::Climate, public uart::UARTDevice, pub
     // Last received 0xCB message.
     uint8_t last_recv_type_b_settings_[MsgLen] = {};
 
+    // Track repeated status messages to handle edge case with
+    // corrupted messages.
+    uint8_t repeated_status_[MsgLen] = {};
+    uint8_t repeated_status_count_ = 0;
+    static const uint8_t repeated_status_threshold_ = 2;
+
     uint8_t send_buf_[MsgLen] = {};
     uint32_t last_sent_status_millis_ = 0;
     uint32_t last_sent_recv_type_b_millis_ = 0;
@@ -1083,13 +1089,33 @@ private:
     }
 
     void process_status_message(MessageSender sender, const uint8_t* buffer) {
+        // Track instances of repeated status messages.  If the same
+        // status message arrives enough times without the changed
+        // settings bit set, accept it anyway, since a previous status
+        // message with the changed settings bit set may have been
+        // corrupted.
+        if (memcmp(repeated_status_, buffer, MsgLen) == 0) {
+            if (repeated_status_count_ < 255) {
+                repeated_status_count_++;
+            };
+        } else {
+            memcpy(repeated_status_, buffer, MsgLen);
+            repeated_status_count_ = 1;
+        }
+
         // To protect against corrupted messages, only allow settings
         // changes if this is the first status message received from
         // the LG unit, or if the settings changed bit is set.  If
         // settings are unexpectedly changed, ignore the entire
-        // message.
+        // message.  However, if the same message without the settings
+        // changed bit arrives sufficiently many times, accept it
+        // anyway since the original change message may have been
+        // corrupted.
+        bool repeated_status_override =
+            repeated_status_count_ >= repeated_status_threshold_;
         bool settings_changed = (buffer[1] & 0x01) != 0;
-        bool changes_allowed = waiting_for_first_status || settings_changed;
+        bool changes_allowed = waiting_for_first_status || settings_changed ||
+            repeated_status_override;
 
         // Whether the entire message should be ignored because it is
         // invalid.
@@ -1193,6 +1219,13 @@ private:
                     ESP_LOGD(TAG, "ignoring incoming settings changes because "
                              "of an outgoing pending send");
                 } else {
+                    if (!settings_changed && repeated_status_override) {
+                        ESP_LOGW(TAG, "accepting settings change without "
+                                 "changed bit set after the same status "
+                                 "message has been received consecutively "
+                                 "%d times", repeated_status_count_);
+                    }
+
                     this->mode = new_mode;
                     this->fan_mode = new_fan_mode;
                     if (swing_mode_changed) {
@@ -1245,9 +1278,17 @@ private:
                         }
                         change_str += change;
                     }
+
+                    const char* times = "time";
+                    if (repeated_status_count_ > 1) {
+                        times = "times";
+                    }
                     ESP_LOGE(TAG, "ignoring status message with unexpected "
-                             "changes without changed bit set: %s",
-                             change_str.c_str());
+                             "changes without changed bit set: %s; "
+                             "exact message received consecutively %d %s "
+                             "(will be accepted after %d times)",
+                             change_str.c_str(), repeated_status_count_,
+                             times, repeated_status_threshold_);
                     ignore_message = true;
                 }
             }
