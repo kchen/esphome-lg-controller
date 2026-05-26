@@ -551,8 +551,10 @@ public:
             bytes_received = true;
             recv_buf_len_++;
             if (recv_buf_len_ == MsgLen) {
-                process_message(recv_buf_);
-                recv_buf_len_ = 0;
+                // process_message usually returns 0 to reset the
+                // message, but can sometimes discard and move bytes,
+                // and returns the number of bytes kept in the buffer.
+                recv_buf_len_ = process_message(recv_buf_);
             }
         }
 
@@ -1012,7 +1014,7 @@ private:
         last_sent_recv_type_b_millis_ = last_write_millis_;
     }
 
-    void process_message(const uint8_t* buffer) {
+    size_t process_message(const uint8_t* buffer) {
         ESP_LOGD(TAG, "received %s", format_hex_pretty(buffer, MsgLen).c_str());
 
         if (calc_checksum(buffer) != buffer[12]) {
@@ -1021,10 +1023,27 @@ private:
             auto is_zero = [](uint8_t b) { return b == 0; };
             if (std::all_of(buffer, buffer + MsgLen, is_zero)) {
                 ESP_LOGD(TAG, "Ignoring padding message sent by unit");
-                return;
+                return 0;
             }
             ESP_LOGE(TAG, "invalid checksum %s", format_hex_pretty(buffer, MsgLen).c_str());
-            return;
+
+            // Handle the case where the message framing is
+            // mismatched.  The message timeout takes care of most
+            // framing issues, but this helps in other cases.
+            for (size_t i = 1; i < MsgLen; i++) {
+                uint8_t sender = recv_buf_[i] & 0xF8;
+                uint8_t msg_type = recv_buf_[i] & 0x07;
+                if ((sender == 0xC8 || sender == 0xA8 || sender == 0x28) &&
+                    msg_type <= 3){
+                    size_t keep_len = MsgLen - i;
+                    memmove(recv_buf_, recv_buf_ + i, keep_len);
+                    ESP_LOGW(TAG, "discarding first %d bytes of invalid "
+                             "message to start with valid byte", i);
+                    return keep_len;
+                }
+            }
+
+            return 0;
         }
 
         if (pending_send_ != PendingSendKind::None && memcmp(send_buf_, buffer, MsgLen) == 0) {
@@ -1043,7 +1062,7 @@ private:
             }
 
             pending_send_ = PendingSendKind::None;
-            return;
+            return 0;
         }
 
         // Determine message type.
@@ -1055,19 +1074,19 @@ private:
             case 0xA8:
                 if (!slave_) {
                     // Ignore (our own?) master controller messages.
-                    return;
+                    return 0;
                 }
                 sender = MessageSender::Master;
                 break;
             case 0x28:
                 if (slave_) {
                     // Ignore (our own?) slave controller messages.
-                    return;
+                    return 0;
                 }
                 sender = MessageSender::Slave;
                 break;
             default:
-                return; // Unknown message sender. Ignore.
+                return 0; // Unknown message sender. Ignore.
         }
 
         switch (buffer[0] & 0b111) {
@@ -1084,8 +1103,9 @@ private:
                 process_type_b_settings_message(*sender, buffer);
                 break;
             default:
-                return;
+                break;
         }
+        return 0;
     }
 
     void process_status_message(MessageSender sender, const uint8_t* buffer) {
